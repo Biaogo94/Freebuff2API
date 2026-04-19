@@ -157,7 +157,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id)
+		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, lease.freebuffInstanceID)
 		if err != nil {
 			s.runs.Release(lease)
 			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
@@ -190,6 +190,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		if isSessionInvalid(resp.StatusCode, errorBody) {
+			s.logger.Printf("%s: free session invalid, refreshing and retrying", lease.pool.name)
+			lease.pool.invalidateSession(strings.TrimSpace(string(errorBody)))
+			s.runs.Release(lease)
+			continue
+		}
+
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
 		}
@@ -203,7 +210,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusBadGateway, "upstream run expired twice in a row", "server_error", "")
 }
 
-func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID string) ([]byte, error) {
+func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, freebuffInstanceID string) ([]byte, error) {
 	cloned := cloneMap(payload)
 	cloned["model"] = requestedModel
 
@@ -221,6 +228,9 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	metadata["run_id"] = runID
 	metadata["cost_mode"] = "free"
 	metadata["client_id"] = generateClientSessionId()
+	if strings.TrimSpace(freebuffInstanceID) != "" {
+		metadata["freebuff_instance_id"] = strings.TrimSpace(freebuffInstanceID)
+	}
 	cloned["codebuff_metadata"] = metadata
 
 	body, err := json.Marshal(cloned)
@@ -553,6 +563,22 @@ func isRunInvalid(statusCode int, body []byte) bool {
 	}
 	message := strings.ToLower(string(body))
 	return strings.Contains(message, "runid not found") || strings.Contains(message, "runid not running")
+}
+
+func isSessionInvalid(statusCode int, body []byte) bool {
+	switch statusCode {
+	case 409, 410, 426, 428, 429:
+	default:
+		return false
+	}
+
+	_, _, code := extractUpstreamError(bytes.TrimSpace(body))
+	switch code {
+	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired":
+		return true
+	default:
+		return false
+	}
 }
 
 func writePassthroughError(w http.ResponseWriter, statusCode int, body []byte) {

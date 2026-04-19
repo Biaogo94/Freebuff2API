@@ -33,6 +33,10 @@ type tokenPool struct {
 	draining      []*managedRun
 	lastError     string
 	cooldownUntil time.Time
+	sessionStatus string
+	sessionID     string
+	sessionPollAt time.Time
+	sessionExpiry time.Time
 }
 
 type managedRun struct {
@@ -45,8 +49,9 @@ type managedRun struct {
 }
 
 type runLease struct {
-	pool *tokenPool
-	run  *managedRun
+	pool               *tokenPool
+	run                *managedRun
+	freebuffInstanceID string
 }
 
 type tokenSnapshot struct {
@@ -189,6 +194,11 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 }
 
 func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
+	instanceID, err := p.ensureSessionReady(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
@@ -213,7 +223,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 	}
 	run.inflight++
 	run.requestCount++
-	return &runLease{pool: p, run: run}, nil
+	return &runLease{pool: p, run: run, freebuffInstanceID: instanceID}, nil
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
@@ -390,6 +400,129 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 	}
 }
 
+func (p *tokenPool) invalidateSession(reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sessionStatus = ""
+	p.sessionID = ""
+	p.sessionPollAt = time.Time{}
+	p.sessionExpiry = time.Time{}
+	if reason != "" {
+		p.lastError = reason
+	}
+}
+
+func (p *tokenPool) ensureSessionReady(ctx context.Context) (string, error) {
+	for {
+		p.mu.Lock()
+		status := p.sessionStatus
+		instanceID := p.sessionID
+		pollAt := p.sessionPollAt
+		expiry := p.sessionExpiry
+		p.mu.Unlock()
+
+		if status == "disabled" {
+			return "", nil
+		}
+		if status == "active" && strings.TrimSpace(instanceID) != "" {
+			if expiry.IsZero() || time.Now().Before(expiry.Add(-5*time.Second)) {
+				return instanceID, nil
+			}
+		}
+
+		if !pollAt.IsZero() && time.Now().Before(pollAt) {
+			waitFor := time.Until(pollAt)
+			timer := time.NewTimer(waitFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		var (
+			state *FreeSessionState
+			err   error
+		)
+		if strings.TrimSpace(instanceID) != "" && (status == "queued" || status == "active") {
+			state, err = p.client.GetFreeSession(ctx, p.token, instanceID)
+		} else {
+			state, err = p.client.PostFreeSession(ctx, p.token)
+		}
+		if err != nil {
+			p.mu.Lock()
+			p.lastError = err.Error()
+			p.sessionPollAt = time.Now().Add(5 * time.Second)
+			p.mu.Unlock()
+			return "", err
+		}
+
+		ready, nextInstanceID, delay := p.applyFreeSessionState(state)
+		if ready {
+			return nextInstanceID, nil
+		}
+
+		if delay <= 0 {
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *tokenPool) applyFreeSessionState(state *FreeSessionState) (bool, string, time.Duration) {
+	if state == nil {
+		return false, "", time.Second
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.sessionStatus = strings.TrimSpace(state.Status)
+	p.sessionID = strings.TrimSpace(state.InstanceID)
+	p.sessionPollAt = time.Time{}
+	p.sessionExpiry = state.ExpiresAt
+	p.lastError = ""
+
+	switch p.sessionStatus {
+	case "disabled":
+		p.sessionID = ""
+		return true, "", 0
+	case "active":
+		if p.sessionID == "" {
+			p.lastError = "free session active response missing instance id"
+			return false, "", time.Second
+		}
+		return true, p.sessionID, 0
+	case "queued":
+		delay := time.Duration(state.EstimatedWaitMs) * time.Millisecond
+		if delay < time.Second {
+			delay = time.Second
+		}
+		if delay > 15*time.Second {
+			delay = 15 * time.Second
+		}
+		p.sessionPollAt = time.Now().Add(delay)
+		p.lastError = fmt.Sprintf("freebuff waiting room queued (position %d/%d)", maxInt(state.Position, 1), maxInt(state.QueueDepth, maxInt(state.Position, 1)))
+		return false, "", delay
+	case "none", "ended", "superseded":
+		return false, "", 0
+	default:
+		if state.Message != "" {
+			p.lastError = state.Message
+		} else {
+			p.lastError = "unexpected free session status: " + p.sessionStatus
+		}
+		return false, "", time.Second
+	}
+}
+
 func (p *tokenPool) snapshot() tokenSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -410,4 +543,11 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		})
 	}
 	return snapshot
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

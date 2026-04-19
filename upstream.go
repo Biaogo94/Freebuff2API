@@ -19,6 +19,19 @@ type UpstreamClient struct {
 	userAgent  string
 }
 
+type FreeSessionState struct {
+	Status                 string    `json:"status"`
+	InstanceID             string    `json:"instanceId"`
+	Position               int       `json:"position"`
+	QueueDepth             int       `json:"queueDepth"`
+	EstimatedWaitMs        int64     `json:"estimatedWaitMs"`
+	RemainingMs            int64     `json:"remainingMs"`
+	ExpiresAt              time.Time `json:"expiresAt"`
+	GracePeriodEndsAt      time.Time `json:"gracePeriodEndsAt"`
+	GracePeriodRemainingMs int64     `json:"gracePeriodRemainingMs"`
+	Message                string    `json:"message"`
+}
+
 func NewUpstreamClient(cfg Config) *UpstreamClient {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if cfg.HTTPProxy != "" {
@@ -122,6 +135,14 @@ func (c *UpstreamClient) ChatCompletions(ctx context.Context, authToken string, 
 	return resp, responseBody, nil
 }
 
+func (c *UpstreamClient) PostFreeSession(ctx context.Context, authToken string) (*FreeSessionState, error) {
+	return c.doFreeSession(ctx, http.MethodPost, authToken, "")
+}
+
+func (c *UpstreamClient) GetFreeSession(ctx context.Context, authToken, instanceID string) (*FreeSessionState, error) {
+	return c.doFreeSession(ctx, http.MethodGet, authToken, instanceID)
+}
+
 func (c *UpstreamClient) doJSON(ctx context.Context, authToken, path string, body []byte) (*http.Response, error) {
 	requestURL, err := url.JoinPath(c.baseURL, path)
 	if err != nil {
@@ -142,6 +163,44 @@ func (c *UpstreamClient) doJSON(ctx context.Context, authToken, path string, bod
 		return nil, fmt.Errorf("send upstream request: %w", err)
 	}
 	return resp, nil
+}
+
+func (c *UpstreamClient) doFreeSession(ctx context.Context, method, authToken, instanceID string) (*FreeSessionState, error) {
+	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
+	if err != nil {
+		return nil, fmt.Errorf("build free session url: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create free session request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+authToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", c.userAgent)
+	if method == http.MethodGet && strings.TrimSpace(instanceID) != "" {
+		req.Header.Set("X-Freebuff-Instance-Id", strings.TrimSpace(instanceID))
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send free session request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read free session response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("free session %s failed with status %d: %s", method, resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	var parsed FreeSessionState
+	if err := json.Unmarshal(responseBody, &parsed); err != nil {
+		return nil, fmt.Errorf("decode free session response: %w", err)
+	}
+	return &parsed, nil
 }
 
 func retryAfterDuration(headerValue string) time.Duration {
