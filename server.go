@@ -270,7 +270,7 @@ func (s *Server) proxyChatRequest(
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		lease, err := s.runs.Acquire(r.Context(), agentID)
+		lease, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
 			var waitingErr *waitingRoomError
 			if errors.As(err, &waitingErr) {
@@ -286,7 +286,7 @@ func (s *Server) proxyChatRequest(
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
+		sessionInstanceID, err := lease.pool.ensureSession(r.Context(), requestedModel)
 		if err != nil {
 			s.runs.Release(lease)
 			var waitingErr *waitingRoomError
