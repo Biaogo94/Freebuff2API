@@ -40,6 +40,7 @@ type tokenPool struct {
 type managedRun struct {
 	id           string
 	agentID      string
+	model        string
 	startedAt    time.Time
 	inflight     int
 	requestCount int
@@ -55,6 +56,7 @@ type tokenSnapshot struct {
 	Name              string        `json:"name"`
 	Runs              []runSnapshot `json:"runs"`
 	DrainingRuns      int           `json:"draining_runs"`
+	SessionModel      string        `json:"session_model,omitempty"`
 	SessionStatus     string        `json:"session_status,omitempty"`
 	SessionInstanceID string        `json:"session_instance_id,omitempty"`
 	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
@@ -67,6 +69,7 @@ type tokenSnapshot struct {
 
 type runSnapshot struct {
 	AgentID      string    `json:"agent_id"`
+	Model        string    `json:"model,omitempty"`
 	RunID        string    `json:"run_id"`
 	StartedAt    time.Time `json:"started_at"`
 	Inflight     int       `json:"inflight"`
@@ -157,11 +160,8 @@ func (m *RunManager) prewarm(agentIDs []string) {
 	defer cancel()
 
 	for _, pool := range m.pools {
-		if _, err := pool.ensureSession(ctx); err != nil {
-			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
-		}
 		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
+			if err := pool.rotateAgent(ctx, agentID, ""); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
 			} else {
 				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
@@ -180,7 +180,7 @@ func (m *RunManager) Close(ctx context.Context) {
 	}
 }
 
-func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	if len(m.pools) == 0 {
 		return nil, errors.New("no auth tokens configured")
 	}
@@ -190,7 +190,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	var waiting []*waitingRoomError
 	for offset := 0; offset < len(m.pools); offset++ {
 		pool := m.pools[(startIndex+offset)%len(m.pools)]
-		lease, err := pool.acquire(ctx, agentID)
+		lease, err := pool.acquire(ctx, agentID, model)
 		if err == nil {
 			return lease, nil
 		}
@@ -245,7 +245,11 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 	return snapshots
 }
 
-func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, error) {
+	if err := p.prepareModel(ctx, model); err != nil {
+		return nil, err
+	}
+
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
@@ -253,16 +257,16 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		return nil, fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
 	}
 	run := p.runs[agentID]
-	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
+	needsRotate := run == nil || run.model != model || time.Since(run.startedAt) >= p.cfg.RotationInterval
 	p.mu.Unlock()
 
 	if needsRotate {
-		if err := p.rotateAgent(ctx, agentID); err != nil {
+		if err := p.rotateAgent(ctx, agentID, model); err != nil {
 			return nil, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
+	if _, err := p.ensureSession(ctx, model); err != nil {
 		return nil, err
 	}
 
@@ -278,8 +282,10 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
-	if _, err := p.ensureSession(ctx); err != nil {
-		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+	if model := p.currentSessionModel(); model != "" {
+		if _, err := p.ensureSession(ctx, model); err != nil {
+			p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+		}
 	}
 
 	p.mu.Lock()
@@ -293,7 +299,13 @@ func (p *tokenPool) maintain(ctx context.Context) error {
 	p.mu.Unlock()
 
 	for _, agentID := range toRotate {
-		if err := p.rotateAgent(ctx, agentID); err != nil {
+		model := ""
+		p.mu.Lock()
+		if run := p.runs[agentID]; run != nil {
+			model = run.model
+		}
+		p.mu.Unlock()
+		if err := p.rotateAgent(ctx, agentID, model); err != nil {
 			p.logger.Printf("%s: rotate agent %s failed: %v", p.name, agentID, err)
 		}
 	}
@@ -332,7 +344,7 @@ func (p *tokenPool) shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
+func (p *tokenPool) rotateAgent(ctx context.Context, agentID, model string) error {
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
@@ -354,6 +366,7 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	p.runs[agentID] = &managedRun{
 		id:        runID,
 		agentID:   agentID,
+		model:     model,
 		startedAt: time.Now(),
 	}
 	p.lastError = ""
@@ -469,6 +482,7 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		LastError:     p.lastError,
 	}
 	if p.session != nil {
+		snapshot.SessionModel = p.session.model
 		snapshot.SessionStatus = string(p.session.status)
 		snapshot.SessionInstanceID = p.session.instanceID
 		snapshot.SessionExpiresAt = p.session.expiresAt
@@ -479,6 +493,7 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
 			AgentID:      agentID,
+			Model:        run.model,
 			RunID:        run.id,
 			StartedAt:    run.startedAt,
 			Inflight:     run.inflight,
