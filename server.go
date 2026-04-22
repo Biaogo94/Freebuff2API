@@ -264,7 +264,12 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	maxAttempts := len(s.cfg.AuthTokens) + 1
+	if maxAttempts < 2 {
+		maxAttempts = 2
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
 		if err != nil {
 			var waitingErr *waitingRoomError
@@ -318,6 +323,21 @@ func (s *Server) proxyChatRequest(
 			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
 			s.runs.Release(lease)
 			return
+		}
+
+		message, _, code := extractUpstreamError(errorBody)
+		if isBannedErrorMessage(string(errorBody)) {
+			s.logger.Printf("%s: upstream token banned, disabling token", lease.pool.name)
+			lease.pool.disable("upstream token banned")
+			s.runs.Release(lease)
+			continue
+		}
+		if strings.TrimSpace(code) == "session_model_mismatch" {
+			s.logger.Printf("%s: session model mismatch on run %s, rotating run and refreshing session", lease.pool.name, lease.run.id)
+			lease.pool.invalidateSession(strings.TrimSpace(message))
+			s.runs.Invalidate(lease, strings.TrimSpace(message))
+			s.runs.Release(lease)
+			continue
 		}
 
 		if isSessionInvalid(resp.StatusCode, errorBody) {
@@ -388,14 +408,9 @@ func isSessionInvalid(statusCode int, errorBody []byte) bool {
 	if statusCode < 400 {
 		return false
 	}
-	var payload struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(errorBody, &payload); err != nil {
-		return false
-	}
-	switch strings.TrimSpace(payload.Error) {
-	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired":
+	_, _, code := extractUpstreamError(errorBody)
+	switch strings.TrimSpace(code) {
+	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired", "session_model_mismatch":
 		return true
 	default:
 		return false

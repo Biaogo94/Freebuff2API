@@ -35,6 +35,7 @@ type tokenPool struct {
 	sessionRefreshCh chan struct{}
 	lastError        string
 	cooldownUntil    time.Time
+	disabled         bool
 }
 
 type managedRun struct {
@@ -63,6 +64,7 @@ type tokenSnapshot struct {
 	SessionPollAt     time.Time     `json:"session_poll_at,omitempty"`
 	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
 	LastError         string        `json:"last_error,omitempty"`
+	Disabled          bool          `json:"disabled,omitempty"`
 }
 
 type runSnapshot struct {
@@ -157,8 +159,14 @@ func (m *RunManager) prewarm(agentIDs []string) {
 	defer cancel()
 
 	for _, pool := range m.pools {
+		if pool.isDisabled() {
+			continue
+		}
 		if _, err := pool.ensureSession(ctx); err != nil {
 			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
+		}
+		if pool.isDisabled() {
+			continue
 		}
 		for _, agentID := range agentIDs {
 			if err := pool.rotateAgent(ctx, agentID); err != nil {
@@ -247,6 +255,14 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 
 func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
 	p.mu.Lock()
+	if p.disabled {
+		lastError := p.lastError
+		p.mu.Unlock()
+		if lastError == "" {
+			lastError = "token disabled"
+		}
+		return nil, errors.New(lastError)
+	}
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
@@ -278,8 +294,14 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
+	if p.isDisabled() {
+		return nil
+	}
 	if _, err := p.ensureSession(ctx); err != nil {
 		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+	}
+	if p.isDisabled() {
+		return nil
 	}
 
 	p.mu.Lock()
@@ -334,6 +356,14 @@ func (p *tokenPool) shutdown(ctx context.Context) error {
 
 func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 	p.mu.Lock()
+	if p.disabled {
+		lastError := p.lastError
+		p.mu.Unlock()
+		if lastError == "" {
+			lastError = "token disabled"
+		}
+		return errors.New(lastError)
+	}
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
@@ -343,6 +373,10 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 
 	runID, err := p.client.StartRun(ctx, p.token, agentID)
 	if err != nil {
+		if isBannedErrorMessage(err.Error()) {
+			p.disable("upstream token banned")
+			return err
+		}
 		p.mu.Lock()
 		p.lastError = err.Error()
 		p.mu.Unlock()
@@ -467,6 +501,7 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		DrainingRuns:  len(p.draining),
 		CooldownUntil: p.cooldownUntil,
 		LastError:     p.lastError,
+		Disabled:      p.disabled,
 	}
 	if p.session != nil {
 		snapshot.SessionStatus = string(p.session.status)
@@ -486,4 +521,26 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		})
 	}
 	return snapshot
+}
+
+func (p *tokenPool) disable(reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.disabled = true
+	p.session = nil
+	p.cooldownUntil = time.Time{}
+	if reason != "" {
+		p.lastError = reason
+	}
+}
+
+func (p *tokenPool) isDisabled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.disabled
+}
+
+func isBannedErrorMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, `"status":"banned"`) || strings.Contains(message, `"status": "banned"`) || strings.Contains(message, "status\":\"banned")
 }

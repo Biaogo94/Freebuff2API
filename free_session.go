@@ -81,6 +81,9 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		if err != nil {
 			p.session = nil
 			p.lastError = err.Error()
+			if isBannedErrorMessage(err.Error()) {
+				p.disabled = true
+			}
 		} else if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
 			p.lastError = waitingErr.Error()
 		} else {
