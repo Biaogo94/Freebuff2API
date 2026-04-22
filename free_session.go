@@ -168,7 +168,7 @@ func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSe
 			return &cachedSession{
 				status:     sessionStatusActive,
 				instanceID: instanceID,
-				model:      firstNonEmptyString(strings.TrimSpace(state.Model), model),
+				model:      firstNonEmptyTrimmedString(strings.TrimSpace(state.Model), model),
 				expiresAt:  expiresAt,
 			}, instanceID, nil
 		case sessionStatusQueued:
@@ -181,7 +181,7 @@ func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSe
 			return &cachedSession{
 				status:     sessionStatusQueued,
 				instanceID: instanceID,
-				model:      firstNonEmptyString(strings.TrimSpace(state.Model), model),
+				model:      firstNonEmptyTrimmedString(strings.TrimSpace(state.Model), model),
 				position:   maxInt(state.Position, 1),
 				queueDepth: maxInt(state.QueueDepth, maxInt(state.Position, 1)),
 				pollAt:     time.Now().Add(delay),
@@ -518,7 +518,7 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func firstNonEmptyString(values ...string) string {
+func firstNonEmptyTrimmedString(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return strings.TrimSpace(value)
