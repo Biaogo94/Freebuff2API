@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Freebuff2API 是一个以兼容性和使用体验为重点的 [Freebuff](https://freebuff.com) 代理服务。它会把客户端请求转换成当前 Freebuff 后端所需的协议格式，对外提供更稳定的 OpenAI 兼容接口、Claude 兼容接口，以及 OpenAI Responses API 兼容接口。
+Freebuff2API 是一个以兼容性和使用体验为重点的 [Freebuff](https://freebuff.com) 代理服务。它会把客户端请求转换成当前 Freebuff 后端要求的协议格式，对外提供稳定的 OpenAI 兼容接口、Claude 兼容接口，以及 OpenAI Responses API 兼容接口。
 
 ## 功能特性
 
@@ -14,19 +14,18 @@ Freebuff2API 是一个以兼容性和使用体验为重点的 [Freebuff](https:/
 - 兼容 Freebuff 当前 waiting-room 和按模型绑定的 session 协议
 - 返回稳定的可重试错误码，例如 `waiting_room_queued`、`session_switch_in_progress`、`token_pool_unavailable`
 - 上游返回 banned token 时自动禁用对应 token
-- 支持 YAML / JSON 配置文件
-- 支持运行时热加载配置
+- 支持 YAML / JSON 配置文件和运行时热加载
 - 支持通过 `AUTH_TOKEN_DIR` 从目录加载 token
 - 提供 `GET /healthz` 和 `GET /status` 运行状态接口
 - 支持上游 HTTP 代理
 
 ## 获取 Auth Token
 
-运行 Freebuff2API 需要一个或多个 Freebuff auth token。
+Freebuff2API 需要一个或多个 Freebuff auth token。
 
 ### 方式一：网页获取
 
-访问 **[https://freebuff.llm.pm](https://freebuff.llm.pm)**，登录你的 Freebuff 账号后复制页面展示的 auth token。
+访问 **[https://freebuff.llm.pm](https://freebuff.llm.pm)**，登录你的 Freebuff 账号后，复制页面展示的 auth token。
 
 ### 方式二：Freebuff CLI
 
@@ -36,11 +35,11 @@ Freebuff2API 是一个以兼容性和使用体验为重点的 [Freebuff](https:/
 npm i -g freebuff
 ```
 
-运行 `freebuff` 并完成登录。登录后 token 会保存到本地凭证文件中：
+运行 `freebuff` 并完成登录流程。登录后 token 会保存在本地凭证文件中：
 
 | 系统 | 凭证路径 |
 |---|---|
-| Windows | `C:\Users\<用户名>\.config\manicode\credentials.json` |
+| Windows | `C:\Users\<username>\.config\manicode\credentials.json` |
 | Linux / macOS | `~/.config/manicode/credentials.json` |
 
 示例：
@@ -80,7 +79,7 @@ HTTP_PROXY: ""
 |---|---|
 | `LISTEN_ADDR` | 服务监听地址，默认 `:8080` |
 | `UPSTREAM_BASE_URL` | 上游 Freebuff 地址，默认 `https://www.codebuff.com` |
-| `AUTH_TOKENS` | 直接写在配置里的 token；文件中是数组，环境变量中用逗号分隔 |
+| `AUTH_TOKENS` | 直接写在配置中的 token；文件中是数组，环境变量中用逗号分隔 |
 | `AUTH_TOKEN_DIR` | 可选 token 目录，支持纯文本、JSON、YAML 三种文件格式 |
 | `ROTATION_INTERVAL` | run 轮换间隔，默认 `6h` |
 | `REQUEST_TIMEOUT` | 上游请求超时时间，默认 `15m` |
@@ -153,19 +152,9 @@ go build -o Freebuff2API .
 ./Freebuff2API -config config.yaml
 ```
 
-## 免责说明
-
-本项目与 OpenAI、Codebuff、Freebuff 没有任何官方关联，相关商标归各自所有者所有。
-
-本仓库仅用于交流、实验和学习，不构成生产建议。本项目按 “as-is” 方式提供，使用风险由使用者自行承担。
-
-## License
-
-MIT
-
 ## Codex CLI 配置
 
-Freebuff2API 现在可以通过 OpenAI `Responses API` 作为 Codex CLI 的自定义 provider 使用。
+Freebuff2API 可以通过 OpenAI `Responses API` 作为 Codex CLI 的自定义 provider 使用。
 
 在 `~/.codex/config.toml` 中增加一个独立 profile：
 
@@ -187,7 +176,7 @@ experimental_bearer_token = "your-client-api-key"
 
 同时创建 `~/.codex/freebuff-model-catalog.json`，把网关当前暴露出来的模型写进去。至少要包含 profile 里设置的同一个模型 id。
 
-目前 Codex CLI 对自定义 provider 的 model catalog 要求是“完整 metadata”，不只是模型 id 列表。最稳的做法是：
+目前 Codex CLI 对自定义 provider 的 model catalog 要求是完整 metadata，不只是模型 id 列表。更稳的做法是：
 
 1. 运行 `codex debug models`
 2. 复制一个能力相近的模型条目
@@ -208,11 +197,11 @@ experimental_bearer_token = "your-client-api-key"
 codex -p freebuff
 ```
 
-## Claude Code 閰嶇疆
+## Claude Code 配置
 
-Freebuff2API 涔熷彲浠ヤ綔涓?Claude Code 鐨勭綉鍏筹紝閫氳繃 Anthropic 鍏煎鎺ュ彛鎻愪緵鏈嶅姟銆?
+Freebuff2API 也可以作为 Claude Code 的网关，通过 Anthropic 兼容接口提供服务。
 
-`~/.claude/settings.json` 绀轰緥锛?
+`~/.claude/settings.json` 示例：
 
 ```json
 {
@@ -238,9 +227,19 @@ Freebuff2API 涔熷彲浠ヤ綔涓?Claude Code 鐨勭綉鍏筹紝閫氳繃 Anthr
 }
 ```
 
-璇存槑锛?
+说明：
 
-- `ANTHROPIC_BASE_URL` 瑕佸啓缃戝叧鏍圭洰褰曪紝涓嶈甯?`/v1`
-- `ANTHROPIC_DEFAULT_*_MODEL` 瑕佹槧灏勫埌缃戝叧褰撳墠瀹為檯鏆撮湶鐨勬ā鍨?id
-- `skipDangerousModePermissionPrompt` 鍙渶淇濈暀鍦?`permissions` 閲岋紝涓嶉渶鍐嶅啓涓€浠介《灞傚瓧娈?
-- 濡傛灉缃戝叧寮€鍚簡瀹㈡埛绔壌鏉冿紝璇锋妸鍗犱綅鍊兼崲鎴愮湡瀹炵殑 key
+- `ANTHROPIC_BASE_URL` 要写网关根地址，不要带 `/v1`
+- `ANTHROPIC_DEFAULT_*_MODEL` 要映射到网关当前实际暴露的模型 id
+- `skipDangerousModePermissionPrompt` 只需要保留在 `permissions` 里，不要再写一份顶层字段
+- 如果网关启用了客户端鉴权，请把占位值换成真实的 key
+
+## 免责声明
+
+本项目与 OpenAI、Codebuff、Freebuff 没有任何官方关联，相关商标归各自所有者所有。
+
+本仓库仅用于交流、实验和学习，不构成生产建议。本项目按 “as-is” 方式提供，使用风险由使用者自行承担。
+
+## License
+
+MIT
