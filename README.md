@@ -152,6 +152,88 @@ go build -o Freebuff2API .
 ./Freebuff2API -config config.yaml
 ```
 
+## Codex CLI
+
+Freebuff2API can be used as a custom provider for Codex CLI via the OpenAI `Responses API`.
+
+Add a dedicated profile to `~/.codex/config.toml`:
+
+```toml
+[profiles.freebuff]
+model = "your-model-id"
+model_provider = "freebuff"
+model_reasoning_effort = "high"
+model_reasoning_summary = "none"
+model_verbosity = "medium"
+model_catalog_json = "C:\\Users\\<username>\\.codex\\freebuff-model-catalog.json"
+
+[model_providers.freebuff]
+name = "Freebuff"
+base_url = "https://your-gateway.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "your-client-api-key"
+```
+
+Create `~/.codex/freebuff-model-catalog.json` and register the models exposed by your gateway. At minimum, include the same model id you set in the profile.
+
+Codex CLI currently expects full model metadata for custom providers, not just a list of model ids. The most reliable approach is:
+
+1. Run `codex debug models`
+2. Copy a model entry with similar capabilities
+3. Replace fields such as `slug`, `display_name`, and any capability metadata that should differ for your gateway model
+4. Save the resulting `models` array to `freebuff-model-catalog.json`
+
+Notes:
+
+- `base_url` should point to your gateway's `/v1` root.
+- `wire_api` must be `responses`.
+- A custom `model_catalog_json` avoids Codex CLI fallback metadata warnings for non-OpenAI model ids.
+- If your server enforces `API_KEYS`, replace `experimental_bearer_token` with a real client key.
+- Keep the profile `model` and the catalog entry `slug` in sync with whatever model ids your gateway currently exposes.
+
+Then launch Codex with:
+
+```bash
+codex -p freebuff
+```
+
+## Claude Code
+
+Freebuff2API can also be used as a Claude Code gateway through the Anthropic-compatible endpoints.
+
+Example `~/.claude/settings.json`:
+
+```json
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "ANTHROPIC_API_KEY": "your-client-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-gateway.example",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "your-sonnet-model-id",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Sonnet via gateway",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "your-opus-model-id",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus via gateway",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "your-haiku-model-id",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "Haiku via gateway",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ENABLE_TOOL_SEARCH": "true",
+    "NO_PROXY": "localhost"
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "skipDangerousModePermissionPrompt": true
+  },
+  "effortLevel": "high"
+}
+```
+
+Notes:
+
+- `ANTHROPIC_BASE_URL` should be the gateway root and should not include `/v1`.
+- Map the `ANTHROPIC_DEFAULT_*_MODEL` variables to whatever model ids your gateway currently exposes.
+- Keep `skipDangerousModePermissionPrompt` inside `permissions`; the top-level key is unnecessary.
+- If your gateway requires client auth, use a real key instead of the placeholder value.
+
 ## Disclaimer
 
 This project is not affiliated with OpenAI, Codebuff, or Freebuff. All related trademarks belong to their respective owners.

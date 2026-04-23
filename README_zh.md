@@ -162,3 +162,85 @@ go build -o Freebuff2API .
 ## License
 
 MIT
+
+## Codex CLI 配置
+
+Freebuff2API 现在可以通过 OpenAI `Responses API` 作为 Codex CLI 的自定义 provider 使用。
+
+在 `~/.codex/config.toml` 中增加一个独立 profile：
+
+```toml
+[profiles.freebuff]
+model = "your-model-id"
+model_provider = "freebuff"
+model_reasoning_effort = "high"
+model_reasoning_summary = "none"
+model_verbosity = "medium"
+model_catalog_json = "C:\\Users\\<username>\\.codex\\freebuff-model-catalog.json"
+
+[model_providers.freebuff]
+name = "Freebuff"
+base_url = "https://your-gateway.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "your-client-api-key"
+```
+
+同时创建 `~/.codex/freebuff-model-catalog.json`，把网关当前暴露出来的模型写进去。至少要包含 profile 里设置的同一个模型 id。
+
+目前 Codex CLI 对自定义 provider 的 model catalog 要求是“完整 metadata”，不只是模型 id 列表。最稳的做法是：
+
+1. 运行 `codex debug models`
+2. 复制一个能力相近的模型条目
+3. 替换其中的 `slug`、`display_name` 以及需要调整的能力字段
+4. 把生成后的 `models` 数组保存为 `freebuff-model-catalog.json`
+
+说明：
+
+- `base_url` 要写到网关的 `/v1`
+- `wire_api` 必须是 `responses`
+- `model_catalog_json` 用来给非 OpenAI 官方模型补 metadata
+- 如果服务端启用了 `API_KEYS`，把 `experimental_bearer_token` 换成真实的客户端 key
+- profile 里的 `model` 和 catalog 里的 `slug` 必须始终与网关当前实际暴露的模型 id 保持一致
+
+启动方式：
+
+```bash
+codex -p freebuff
+```
+
+## Claude Code 閰嶇疆
+
+Freebuff2API 涔熷彲浠ヤ綔涓?Claude Code 鐨勭綉鍏筹紝閫氳繃 Anthropic 鍏煎鎺ュ彛鎻愪緵鏈嶅姟銆?
+
+`~/.claude/settings.json` 绀轰緥锛?
+
+```json
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "ANTHROPIC_API_KEY": "your-client-api-key",
+    "ANTHROPIC_BASE_URL": "https://your-gateway.example",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "your-sonnet-model-id",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "Sonnet via gateway",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "your-opus-model-id",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus via gateway",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "your-haiku-model-id",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "Haiku via gateway",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ENABLE_TOOL_SEARCH": "true",
+    "NO_PROXY": "localhost"
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "skipDangerousModePermissionPrompt": true
+  },
+  "effortLevel": "high"
+}
+```
+
+璇存槑锛?
+
+- `ANTHROPIC_BASE_URL` 瑕佸啓缃戝叧鏍圭洰褰曪紝涓嶈甯?`/v1`
+- `ANTHROPIC_DEFAULT_*_MODEL` 瑕佹槧灏勫埌缃戝叧褰撳墠瀹為檯鏆撮湶鐨勬ā鍨?id
+- `skipDangerousModePermissionPrompt` 鍙渶淇濈暀鍦?`permissions` 閲岋紝涓嶉渶鍐嶅啓涓€浠介《灞傚瓧娈?
+- 濡傛灉缃戝叧寮€鍚簡瀹㈡埛绔壌鏉冿紝璇锋妸鍗犱綅鍊兼崲鎴愮湡瀹炵殑 key
