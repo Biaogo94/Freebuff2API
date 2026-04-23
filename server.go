@@ -19,6 +19,7 @@ type Server struct {
 	client   *UpstreamClient
 	runs     *RunManager
 	registry *ModelRegistry
+	responses *responseStore
 	started  time.Time
 }
 
@@ -32,6 +33,7 @@ func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server 
 		client:   client,
 		runs:     runManager,
 		registry: registry,
+		responses: newResponseStore(),
 		started:  time.Now(),
 	}
 }
@@ -41,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleClaudeCountTokens)
 	return s.withMiddleware(mux)
@@ -167,6 +170,44 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError,
 		writePassthroughError,
 		writeOpenAISuccessResponse,
+	)
+}
+
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "")
+		return
+	}
+
+	payload, requestedModel, stream, conversation, err := convertResponsesCreateRequestToOpenAI(requestBody, s.responses)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+
+	if !s.registry.HasModel(requestedModel) {
+		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error", "model_not_found")
+		return
+	}
+
+	s.proxyChatRequest(
+		w,
+		r,
+		payload,
+		requestedModel,
+		"invalid_request_error",
+		"server_error",
+		writeOpenAIError,
+		writePassthroughError,
+		func(w http.ResponseWriter, resp *http.Response) error {
+			return writeResponsesSuccessResponse(w, resp, requestedModel, stream, conversation, s.responses)
+		},
 	)
 }
 
