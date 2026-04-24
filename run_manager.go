@@ -5,21 +5,30 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+const (
+	warmPoolRecentWindow = 45 * time.Minute
+	warmPoolMaxModels    = 2
+	warmPoolMinSwitchAge = 10 * time.Minute
+)
+
 type RunManager struct {
 	logger *log.Logger
 	client *UpstreamClient
 
-	mu    sync.RWMutex
-	cfg   Config
-	pools []*tokenPool
+	mu                sync.RWMutex
+	cfg               Config
+	pools             []*tokenPool
+	recentModelDemand map[string]modelDemand
 
 	next atomic.Uint64
+	warm atomic.Bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -40,6 +49,7 @@ type tokenPool struct {
 	lastError        string
 	cooldownUntil    time.Time
 	disabled         bool
+	lastModelSwitch  time.Time
 }
 
 type managedRun struct {
@@ -90,6 +100,11 @@ type waitingRoomError struct {
 	RetryAfter time.Duration
 }
 
+type modelDemand struct {
+	Count         int
+	LastRequested time.Time
+}
+
 func (e *waitingRoomError) Error() string {
 	if e == nil {
 		return "freebuff waiting room queued"
@@ -114,10 +129,11 @@ func (e *waitingRoomError) Error() string {
 
 func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunManager {
 	manager := &RunManager{
-		cfg:    cfg,
-		logger: logger,
-		client: client,
-		stopCh: make(chan struct{}),
+		cfg:               cfg,
+		logger:            logger,
+		client:            client,
+		stopCh:            make(chan struct{}),
+		recentModelDemand: make(map[string]modelDemand),
 	}
 	manager.pools = manager.buildPools(cfg, nil)
 	return manager
@@ -141,6 +157,12 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 					if err := pool.maintain(maintainCtx); err != nil {
 						m.logger.Printf("%s: maintenance failed: %v", pool.name, err)
 					}
+				}
+				if m.warm.CompareAndSwap(false, true) {
+					if err := m.maintainWarmPool(maintainCtx); err != nil {
+						m.logger.Printf("warm pool maintenance failed: %v", err)
+					}
+					m.warm.Store(false)
 				}
 				cancel()
 			case <-m.stopCh:
@@ -229,6 +251,9 @@ func (m *RunManager) Close(ctx context.Context) {
 }
 
 func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, error) {
+	m.noteModelRequest(model)
+	m.kickWarmPool()
+
 	pools := m.snapshotPools()
 	if len(pools) == 0 {
 		return nil, errors.New("no auth tokens configured")
@@ -326,6 +351,191 @@ func (m *RunManager) snapshotPools() []*tokenPool {
 	return pools
 }
 
+func (m *RunManager) noteModelRequest(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	for existingModel, demand := range m.recentModelDemand {
+		if now.Sub(demand.LastRequested) > warmPoolRecentWindow {
+			delete(m.recentModelDemand, existingModel)
+		}
+	}
+
+	demand := m.recentModelDemand[model]
+	demand.Count++
+	demand.LastRequested = now
+	m.recentModelDemand[model] = demand
+}
+
+func (m *RunManager) hotModels(limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	type scoredModel struct {
+		Name          string
+		Count         int
+		LastRequested time.Time
+	}
+	scored := make([]scoredModel, 0, len(m.recentModelDemand))
+	for model, demand := range m.recentModelDemand {
+		if now.Sub(demand.LastRequested) > warmPoolRecentWindow {
+			delete(m.recentModelDemand, model)
+			continue
+		}
+		scored = append(scored, scoredModel{
+			Name:          model,
+			Count:         demand.Count,
+			LastRequested: demand.LastRequested,
+		})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].Count != scored[j].Count {
+			return scored[i].Count > scored[j].Count
+		}
+		return scored[i].LastRequested.After(scored[j].LastRequested)
+	})
+
+	if len(scored) > limit {
+		scored = scored[:limit]
+	}
+
+	models := make([]string, 0, len(scored))
+	for _, item := range scored {
+		models = append(models, item.Name)
+	}
+	return models
+}
+
+func (m *RunManager) kickWarmPool() {
+	if !m.warm.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer m.warm.Store(false)
+		cfg := m.currentConfig()
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+		defer cancel()
+		if err := m.maintainWarmPool(ctx); err != nil {
+			m.logger.Printf("warm pool maintenance failed: %v", err)
+		}
+	}()
+}
+
+func (m *RunManager) maintainWarmPool(ctx context.Context) error {
+	hotModels := m.hotModels(warmPoolMaxModels)
+	if len(hotModels) == 0 {
+		return nil
+	}
+
+	pools := m.snapshotPools()
+	if len(pools) == 0 {
+		return nil
+	}
+
+	eligiblePools := make([]*tokenPool, 0, len(pools))
+	for _, pool := range pools {
+		if !pool.isDisabled() {
+			eligiblePools = append(eligiblePools, pool)
+		}
+	}
+	if len(eligiblePools) == 0 {
+		return nil
+	}
+
+	desired := desiredWarmCounts(len(eligiblePools), hotModels)
+	currentCounts := make(map[string]int, len(desired))
+	currentModel := make(map[*tokenPool]string, len(eligiblePools))
+	excessPools := make([]*tokenPool, 0, len(eligiblePools))
+
+	for _, pool := range eligiblePools {
+		model := strings.TrimSpace(pool.currentSessionModel())
+		currentModel[pool] = model
+		if _, tracked := desired[model]; tracked {
+			currentCounts[model]++
+			continue
+		}
+		excessPools = append(excessPools, pool)
+	}
+
+	for _, model := range hotModels {
+		for currentCounts[model] > desired[model] {
+			for _, pool := range eligiblePools {
+				if strings.TrimSpace(currentModel[pool]) != model {
+					continue
+				}
+				excessPools = append(excessPools, pool)
+				currentModel[pool] = ""
+				currentCounts[model]--
+				break
+			}
+		}
+	}
+
+	used := make(map[*tokenPool]struct{}, len(excessPools))
+	for _, model := range hotModels {
+		for currentCounts[model] < desired[model] {
+			selected := (*tokenPool)(nil)
+			for _, candidate := range excessPools {
+				if _, ok := used[candidate]; ok {
+					continue
+				}
+				selected = candidate
+				break
+			}
+			if selected == nil {
+				return nil
+			}
+
+			if err := selected.warmModel(ctx, model); err != nil {
+				m.logger.Printf("%s: warm %s failed: %v", selected.name, model, err)
+				used[selected] = struct{}{}
+				continue
+			}
+			used[selected] = struct{}{}
+			currentCounts[model]++
+		}
+	}
+
+	return nil
+}
+
+func desiredWarmCounts(totalPools int, models []string) map[string]int {
+	desired := make(map[string]int, len(models))
+	if totalPools <= 0 || len(models) == 0 {
+		return desired
+	}
+
+	activeModels := models
+	if len(activeModels) > totalPools {
+		activeModels = activeModels[:totalPools]
+	}
+
+	for _, model := range activeModels {
+		desired[model] = 1
+	}
+
+	remaining := totalPools - len(activeModels)
+	for i := 0; i < remaining; i++ {
+		model := activeModels[i%len(activeModels)]
+		desired[model]++
+	}
+
+	return desired
+}
+
 func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	p.mu.Lock()
 	if p.disabled {
@@ -371,6 +581,43 @@ func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLea
 	run.inflight++
 	run.requestCount++
 	return &runLease{pool: p, run: run}, nil
+}
+
+func (p *tokenPool) warmModel(ctx context.Context, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" || p.isDisabled() {
+		return nil
+	}
+	currentModel := strings.TrimSpace(p.currentSessionModel())
+	if p.shouldDeferWarmSwitch(model) {
+		return nil
+	}
+
+	if currentModel == "" || currentModel == model {
+		if _, err := p.ensureSession(ctx, model); err == nil {
+			return nil
+		} else {
+			var waitingErr *waitingRoomError
+			if errors.As(err, &waitingErr) && p.currentSessionModel() == model {
+				return nil
+			}
+		}
+	}
+
+	if err := p.prepareModel(ctx, model); err != nil {
+		return err
+	}
+
+	_, err := p.ensureSession(ctx, model)
+	if err == nil {
+		return nil
+	}
+
+	var waitingErr *waitingRoomError
+	if errors.As(err, &waitingErr) {
+		return nil
+	}
+	return err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
@@ -578,6 +825,44 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 	if reason != "" {
 		p.lastError = reason
 	}
+}
+
+func (p *tokenPool) shouldDeferWarmSwitch(targetModel string) bool {
+	targetModel = strings.TrimSpace(targetModel)
+	if targetModel == "" {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.disabled {
+		return true
+	}
+	if now := time.Now(); now.Before(p.cooldownUntil) {
+		return true
+	}
+
+	currentModel := ""
+	if p.session != nil {
+		currentModel = strings.TrimSpace(p.session.model)
+	}
+	if currentModel == "" {
+		for _, run := range p.runs {
+			if strings.TrimSpace(run.model) != "" {
+				currentModel = strings.TrimSpace(run.model)
+				break
+			}
+		}
+	}
+	if currentModel == "" || currentModel == targetModel {
+		return false
+	}
+
+	if !p.lastModelSwitch.IsZero() && time.Since(p.lastModelSwitch) < warmPoolMinSwitchAge {
+		return true
+	}
+	return false
 }
 
 func (p *tokenPool) snapshot() tokenSnapshot {

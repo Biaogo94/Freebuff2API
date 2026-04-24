@@ -310,6 +310,7 @@ func (p *tokenPool) prepareModel(ctx context.Context, model string) error {
 	p.draining = nil
 	p.session = nil
 	p.lastError = ""
+	p.lastModelSwitch = time.Now()
 	p.mu.Unlock()
 
 	var errs []string
